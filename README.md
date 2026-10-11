@@ -76,8 +76,7 @@ Check LSPosed/Vector log (filter `oslokrok`) for:
 - If an update changes the package/interface/method so that nothing
   hooks (`signal hooks=0`), the anchors in `app/src/main/java/net/oslokrok/hook/Hook.java` 
   need updating.
-- "Self-Healing" function hasn't been tested as this module has currently only been tested on
-  the latest app version (v10.14.0).
+- "Self-Healing" function hasn't been thoroughly tested as this module has currently only been tested on the v10.14.0 & v10.16.0.
 
 ---
 
