@@ -7,7 +7,8 @@
 
 This crash is caused by PayPal's own on-device anti-tamper (RASP), which throws
 `RootDetectionSecurityException` (`s=root`) a few seconds after launch. Oslokrok
-neutralises it at the single point where the detection signal is emitted.
+neutralises the detection signal and includes an experimental compatibility hook
+for a separate startup check in PayPal 10.19.0.
 
 ---
 
@@ -45,6 +46,16 @@ Oslokrok locates this method with [DexKit](https://github.com/LuckyPray/DexKit)
 using structural anchors (interface + a 0-arg `signal()` in the `rasp` package)
 so it should survive obfuscation/name changes, across future updates.
 
+PayPal 10.19.0 (version code 1160090180) also contains an `AppVerifier`
+check that deliberately throws `NullPointerException` when two values differ.
+Oslokrok includes an experimental, version-specific hook that adjusts this
+particular result only when called from `AppVerifier.run`. A second hook watches
+for an in-memory DEX verifier that can deliberately exhaust the process heap on
+a mismatched result, and adjusts that result only when called from its verifier
+thread. Both hooks were observed running on PayPal 10.19.0 on one Android 16
+device, with no further crashes during the observed session. The underlying
+detection signals and other device configurations have not been verified.
+
 ---
 
 ## 🧪 Requirements
@@ -76,7 +87,9 @@ Check LSPosed/Vector log (filter `oslokrok`) for:
 - If an update changes the package/interface/method so that nothing
   hooks (`signal hooks=0`), the anchors in `app/src/main/java/net/oslokrok/hook/Hook.java` 
   need updating.
-- "Self-Healing" function hasn't been thoroughly tested as this module has currently only been tested on v10.14.0, v10.16.0, v10.17.0 & V10.18.0.
+- The dynamic hook has not been thoroughly tested; the module has been tested on
+  v10.14.0, v10.16.0, v10.17.0, v10.18.0 and v10.19.0. The additional 10.19.0
+  hooks use version-specific class names and are not self-healing.
 
 ---
 

@@ -1,19 +1,28 @@
 package net.oslokrok.hook;
 
+import android.app.AndroidAppHelper;
+import android.app.Application;
+import android.content.pm.PackageInfo;
+import android.os.Build;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Member;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.Method;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.Collections;
+import java.util.WeakHashMap;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodReplacement;
+import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
@@ -46,6 +55,8 @@ public class Hook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     private static final String SIGNAL = "signal";
     private static final String ABI    = "arm64-v8a";
     private static final String TAG    = "[oslokrok] ";
+    private static final String RUNTIME_CHECK = "o.setReproScreenShotsEnabledSDK";
+    private static final Set<Class<?>> runtimeHooked = Collections.newSetFromMap(new WeakHashMap<>());
 
     private static boolean nativeLoaded = false;
     private String modulePath;
@@ -59,6 +70,9 @@ public class Hook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!TARGET.equals(lpparam.packageName)) return;
         ClassLoader cl = lpparam.classLoader;
+
+        hookVerifierResult(cl);
+        hookRuntimeVerifier();
 
         boolean nativeOk = loadDexKitNative(lpparam);
 
@@ -120,6 +134,110 @@ public class Hook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         XposedBridge.log(TAG + "active on " + TARGET + ", signal hooks=" + hooks
                 + (nativeOk ? " (dexkit)" : " (no-dexkit)"));
+    }
+
+    /** The in-memory verifier thread owns the callback that can crash the process. */
+    private void hookRuntimeVerifier() {
+        try {
+            XposedHelpers.findAndHookMethod(Thread.class, "start", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    Object thread = param.thisObject;
+                    if (!"o.equals".equals(thread.getClass().getName()) || !isPaypal1019()) return;
+                    try {
+                        java.lang.reflect.Field field = thread.getClass()
+                                .getDeclaredField("Camera2StreamConfigurationMap");
+                        field.setAccessible(true);
+                        Object callback = field.get(thread);
+                        if (callback == null || !RUNTIME_CHECK.equals(callback.getClass().getName())) {
+                            XposedBridge.log(TAG + "runtime verifier callback unavailable or unexpected");
+                            return;
+                        }
+                        installRuntimeVerifierHook(callback.getClass());
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "runtime verifier callback lookup failed: " + t);
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "watching for 10.19.0 verifier thread");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "runtime verifier thread hook unavailable: " + t);
+        }
+    }
+
+    private static void installRuntimeVerifierHook(Class<?> type) {
+        synchronized (runtimeHooked) {
+            if (runtimeHooked.contains(type)) return;
+            try {
+                Method method = type.getDeclaredMethod("getHighSpeedVideoFpsRanges", Object[].class);
+                if (Modifier.isStatic(method.getModifiers()) || method.getReturnType() != void.class) {
+                    XposedBridge.log(TAG + "runtime verifier hook skipped: unexpected signature");
+                    return;
+                }
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!isPaypal1019() || !calledFromVerifier("o.equals")) return;
+                        Object adjusted = VerifierResult.adjustRuntime(param.args[0]);
+                        if (adjusted != param.args[0]) {
+                            param.args[0] = adjusted;
+                            XposedBridge.log(TAG + "adjusted 10.19.0 runtime verifier result");
+                        }
+                    }
+                });
+                runtimeHooked.add(type);
+                XposedBridge.log(TAG + "installed 10.19.0 runtime verifier hook");
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + "runtime verifier hook unavailable: " + t);
+            }
+        }
+    }
+
+    /** Target the result consumed by the 10.19.0 verifier, leaving the verifier running. */
+    private void hookVerifierResult(ClassLoader cl) {
+        final String verifier = "com.paypal.oslo.core.startup.AppVerifier";
+        final String detector = "io.ktor.websocket.RawWebSocketCommon$writerJob$1";
+        try {
+            java.lang.reflect.Method method = XposedHelpers.findClass(detector, cl)
+                    .getDeclaredMethod("getHighSpeedVideoSizes$389385d", int.class, Object.class);
+            if (!Modifier.isStatic(method.getModifiers()) || method.getReturnType() != Object[].class) {
+                XposedBridge.log(TAG + "verifier result hook skipped: unexpected signature");
+                return;
+            }
+            XposedBridge.hookMethod(method, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (param.hasThrowable() || !isPaypal1019() || !calledFromVerifier(verifier)) return;
+                    Object adjusted = VerifierResult.adjust(param.getResult(), (Integer) param.args[0]);
+                    if (adjusted != param.getResult()) {
+                        param.setResult(adjusted);
+                        XposedBridge.log(TAG + "adjusted 10.19.0 AppVerifier result");
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "installed 10.19.0 verifier result hook");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "verifier result hook unavailable: " + t);
+        }
+    }
+
+    private static boolean isPaypal1019() {
+        try {
+            Application app = AndroidAppHelper.currentApplication();
+            if (app == null || !TARGET.equals(app.getPackageName())) return false;
+            PackageInfo info = app.getPackageManager().getPackageInfo(TARGET, 0);
+            long code = Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
+            return code == 1160090180L && "10.19.0".equals(info.versionName);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean calledFromVerifier(String verifier) {
+        for (StackTraceElement frame : Thread.currentThread().getStackTrace()) {
+            if (verifier.equals(frame.getClassName()) && "run".equals(frame.getMethodName())) return true;
+        }
+        return false;
     }
 
     /** Load libdexkit.so: try the classloader path, else extract from APK and load by path. */
